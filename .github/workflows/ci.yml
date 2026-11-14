@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Local S3-compatible server used by the integration and e2e tests (same as scripts/s3-server.sh).
+  S3_ENDPOINT: http://localhost:7070
+  S3_REGION: us-east-1
+  S3_ACCESS_KEY: testaccesskey
+  S3_SECRET_KEY: testsecretkey123
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - name: Security header files are in sync with config/security-headers.js
+        run: node scripts/sync-headers.mjs --check
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Build under a sub-path (GitHub Pages)
+        run: npx vite build --outDir dist-pages && node scripts/pages-postbuild.mjs dist-pages
+        env:
+          VITE_BASE_PATH: /s3-storage-manager/
+      - run: npm audit --audit-level=low
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      s3:
+        image: versity/versitygw:v1.11.0
+        ports:
+          - 7070:7070
+        env:
+          ROOT_ACCESS_KEY: testaccesskey
+          ROOT_SECRET_KEY: testsecretkey123
+          VGW_BACKEND: posix
+          VGW_BACKEND_ARG: /srv
+          VGW_CORS_ALLOW_ORIGIN: '*'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Wait for the S3 server
+        run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:7070/ && exit 0; sleep 1; done; exit 1
+      - name: Unit and integration tests
+        run: npm test
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      s3:
+        image: versity/versitygw:v1.11.0
+        ports:
+          - 7070:7070
+        env:
+          ROOT_ACCESS_KEY: testaccesskey
+          ROOT_SECRET_KEY: testsecretkey123
+          VGW_BACKEND: posix
+          VGW_BACKEND_ARG: /srv
+          VGW_CORS_ALLOW_ORIGIN: '*'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}-chromium
+      - name: Install Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install Chromium system dependencies
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      - name: Wait for the S3 server
+        run: for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:7070/ && exit 0; sleep 1; done; exit 1
+      # Both variants: site root (default) and GitHub Pages sub-path with 404.html fallback (pages).
+      - name: E2E (production builds, root and sub-path)
+        run: npm run test:e2e
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14

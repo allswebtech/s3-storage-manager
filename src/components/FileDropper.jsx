@@ -1,563 +1,477 @@
-import { CloudUpload, FileText, X, LoaderCircle, Check, Folder, AlertTriangle } from 'lucide-react'
+import { CloudUpload, FileText, X, LoaderCircle, Check, Folder, TriangleAlert } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import MultiPartUpload from '../api/MultiPartUpload'
-import { HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3'
-import useCredentials from '../hooks/useCredentials'
+import { ListObjectsV2Command } from '@aws-sdk/client-s3'
 import { toast } from 'react-toastify'
+import MultiPartUpload from '../api/MultiPartUpload'
+import headObjectExists from '../api/headObjectExists'
+import { describeS3Error } from '../api/s3Client'
+import useCredentials from '../hooks/useCredentials'
+import { numberedKey, parentPrefix, toPrefix } from '../helpers/keys'
+import { formatBytes } from '../helpers/format'
 
-export default function FileDropper({ currentDirectory = "", uploading = false, setUploading }) {
+const MAX_KEEP_BOTH_ATTEMPTS = 1000
+const ACTIVE = new Set(['pending', 'uploading', 'conflict'])
+
+let idCounter = 0
+function nextId() {
+    idCounter += 1
+    return `u${Date.now().toString(36)}-${idCounter}`
+}
+
+function relativePathOf(file) {
+    return (file.webkitRelativePath || file.relativePath || file.name || '').replace(/^\/+/, '')
+}
+
+// Read all entries from a directory reader (readEntries returns at most ~100 entries per call).
+async function readAllDirectoryEntries(directoryReader) {
+    const entries = []
+    for (;;) {
+        const batch = await new Promise((resolve, reject) => directoryReader.readEntries(resolve, reject))
+        if (!batch || batch.length === 0) break
+        entries.push(...batch)
+    }
+    return entries
+}
+
+// Traverse a FileSystemEntry (file or directory) and collect File objects with their relative path.
+async function traverseFileTree(entry, path = '') {
+    if (entry.isFile) {
+        const file = await new Promise((res, rej) => entry.file(res, rej))
+        // Synthetic relative path for dropped folders (webkitRelativePath is empty for drops).
+        file.relativePath = `${path}${file.name}`
+        return [file]
+    }
+    if (entry.isDirectory) {
+        const entries = await readAllDirectoryEntries(entry.createReader())
+        const nested = await Promise.all(entries.map((ent) => traverseFileTree(ent, `${path}${entry.name}/`)))
+        return nested.flat()
+    }
+    return []
+}
+
+// Keys that already exist directly inside each parent prefix (one non-recursive listing per folder).
+async function existingKeysIn(s3, bucket, parents) {
+    const found = new Set()
+    const failed = []
+    const queue = [...parents]
+    async function worker() {
+        while (queue.length) {
+            const prefix = queue.shift()
+            try {
+                let token
+                do {
+                    const res = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix || undefined, Delimiter: '/', ContinuationToken: token }))
+                    for (const c of res.Contents || []) found.add(c.Key)
+                    token = res.IsTruncated ? res.NextContinuationToken : undefined
+                } while (token)
+            } catch {
+                failed.push(prefix)
+            }
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, worker))
+    return { found, failed: new Set(failed) }
+}
+
+export default function FileDropper({ currentDirectory = '', uploading = false, setUploading, onUploaded }) {
     const [isDragging, setIsDragging] = useState(false)
-    // files: array of { file: File, id, progress (0-100), status: 'pending'|'uploading'|'done'|'error'|'conflict'|'skipped', controller, targetKey? }
+    // Queue items: { id, file, relPath, targetKey, progress, status, error }
+    // status: 'pending' | 'uploading' | 'done' | 'error' | 'canceled' | 'conflict' | 'skipped'
     const [files, setFiles] = useState([])
-    const filesRef = useRef([])
-    // per-file upload index not needed; we track per-file state in `files`
+    const queueRef = useRef([])
+    const controllersRef = useRef(new Map())
+    const timersRef = useRef(new Set())
+    const runningRef = useRef(false)
+    const mountedRef = useRef(true)
     const { s3, credentials } = useCredentials()
-    // cache listings per prefix during the session to avoid repeated ListObjects calls
-    const listCacheRef = useRef(new Map())
+    const bucket = credentials?.name
 
-    // Clear listing cache when credentials/bucket changes to avoid stale results
+    const update = useCallback((fn) => {
+        queueRef.current = fn(queueRef.current)
+        setFiles(queueRef.current)
+    }, [])
+
+    const patch = useCallback((id, changes) => {
+        update(q => q.map(it => (it.id === id ? { ...it, ...changes } : it)))
+    }, [update])
+
+    // Abort everything when the component goes away (e.g. switching to another bucket).
     useEffect(() => {
-        listCacheRef.current.clear()
-    }, [credentials?.name])
-
-    // Read all entries from a directory reader (Chrome/Safari webkit entries)
-    async function readAllDirectoryEntries(directoryReader) {
-        const entries = []
-        // Keep calling readEntries() until it returns an empty array
-        // to ensure we get all entries within this directory
-        // (readEntries may return only a subset per call)
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-                const batch = await new Promise((resolve, reject) => {
-                    directoryReader.readEntries(resolve, reject)
-                })
-            if (!batch || batch.length === 0) break
-            entries.push(...batch)
+        mountedRef.current = true
+        const controllers = controllersRef.current
+        const timers = timersRef.current
+        return () => {
+            mountedRef.current = false
+            controllers.forEach(c => c.abort())
+            timers.forEach(t => clearTimeout(t))
         }
-        return entries
-    }
+    }, [])
 
-    // Traverse a FileSystemEntry (file or directory) and collect File objects
-    async function traverseFileTree(entry, path = "") {
+    async function runQueue() {
+        if (runningRef.current || !s3 || !bucket) return
+        runningRef.current = true
+        setUploading?.(true)
+        let uploadedAny = false
         try {
-            if (entry.isFile) {
-                const file = await new Promise((res, rej) => entry.file(res, rej))
-                // Preserve relative path for folder uploads
-                const relativePath = `${path}${file.name}`
+            for (;;) {
+                if (!mountedRef.current) break
+                const item = queueRef.current.find(f => f.status === 'pending')
+                if (!item) break
+                const controller = new AbortController()
+                controllersRef.current.set(item.id, controller)
+                patch(item.id, { status: 'uploading', progress: 0, error: '' })
                 try {
-                    // Attach a synthetic relativePath if webkitRelativePath is unavailable
-                    // This is safe and used only by our upload logic
-                    // eslint-disable-next-line no-param-reassign
-                    file.relativePath = relativePath
-                } catch {
-                    // ignore assignment failures
+                    await MultiPartUpload(s3, item.file, currentDirectory, bucket, {
+                        onProgress: (uploaded, total) => {
+                            patch(item.id, { progress: total ? Math.round((uploaded / total) * 100) : 100 })
+                        },
+                        signal: controller.signal,
+                        concurrency: 4,
+                        targetKey: item.targetKey,
+                    })
+                    uploadedAny = true
+                    patch(item.id, { status: 'done', progress: 100 })
+                    const t = setTimeout(() => {
+                        timersRef.current.delete(t)
+                        update(q => q.filter(p => p.id !== item.id))
+                    }, 1500)
+                    timersRef.current.add(t)
+                } catch (err) {
+                    const canceled = err?.name === 'AbortError'
+                    patch(item.id, { status: canceled ? 'canceled' : 'error', error: canceled ? '' : describeS3Error(err) })
+                } finally {
+                    controllersRef.current.delete(item.id)
                 }
-                return [file]
             }
-
-            if (entry.isDirectory) {
-                const reader = entry.createReader()
-                const entries = await readAllDirectoryEntries(reader)
-                const nestedFilesArrays = await Promise.all(
-                    entries.map((ent) => traverseFileTree(ent, `${path}${entry.name}/`))
-                )
-                return nestedFilesArrays.flat()
+        } finally {
+            runningRef.current = false
+            if (mountedRef.current) {
+                setUploading?.(false)
+                if (uploadedAny) onUploaded?.()
             }
-
-            return []
-        } catch (error) {
-            throw error
         }
     }
 
-    const handleDragEnter = useCallback((e) => {
-        e.preventDefault()
-        e.stopPropagation()
-        setIsDragging(true)
-    }, [])
+    // Add files: drop duplicates already queued, then check the bucket for existing objects.
+    async function addFiles(fileList) {
+        const dir = toPrefix(currentDirectory)
+        const queuedKeys = new Set(queueRef.current.filter(i => ACTIVE.has(i.status)).map(i => i.targetKey))
+        const unique = []
+        let localSkipped = 0
+        for (const file of fileList) {
+            const relPath = relativePathOf(file)
+            if (!relPath) continue
+            const targetKey = dir + relPath
+            if (queuedKeys.has(targetKey)) {
+                localSkipped++
+                continue
+            }
+            queuedKeys.add(targetKey)
+            unique.push({ id: nextId(), file, relPath, targetKey, progress: 0, status: 'pending', error: '' })
+        }
+        if (localSkipped > 0) toast.warning(`${localSkipped} duplicate file(s) skipped (already in the queue)`, { autoClose: 3000 })
+        if (!unique.length) return
 
-    const handleDragLeave = useCallback((e) => {
-        e.preventDefault()
-        e.stopPropagation()
-        setIsDragging(false)
-    }, [])
+        let existing = new Set()
+        let unverified = new Set()
+        if (s3 && bucket) {
+            const parents = [...new Set(unique.map(u => parentPrefix(u.targetKey)))]
+            const { found, failed } = await existingKeysIn(s3, bucket, parents)
+            existing = found
+            // Listing not allowed for some folders: fall back to per-file checks there.
+            for (const u of unique) {
+                if (!failed.has(parentPrefix(u.targetKey))) continue
+                try {
+                    if (await headObjectExists(s3, u.targetKey, bucket)) existing.add(u.targetKey)
+                } catch {
+                    unverified.add(u.targetKey)
+                }
+            }
+        }
 
-    const handleDragOver = useCallback((e) => {
-        e.preventDefault()
-        e.stopPropagation()
-    }, [])
+        const prepared = unique.map(u => {
+            if (existing.has(u.targetKey)) return { ...u, status: 'conflict', error: 'Already exists' }
+            if (unverified.has(u.targetKey)) return { ...u, status: 'conflict', error: 'Could not check whether it exists' }
+            return u
+        })
+        // Newest additions on top
+        update(q => [...prepared, ...q])
+        runQueue()
+    }
+
+    async function pickAvailableKey(startKey) {
+        const taken = new Set(queueRef.current.filter(i => ACTIVE.has(i.status)).map(i => i.targetKey))
+        for (let n = 1; n <= MAX_KEEP_BOTH_ATTEMPTS; n++) {
+            const candidate = numberedKey(startKey, n)
+            if (taken.has(candidate)) continue
+            if (!(await headObjectExists(s3, candidate, bucket))) return candidate
+        }
+        throw new Error('Could not find a free name')
+    }
+
+    async function keepBoth(item) {
+        try {
+            const freeKey = await pickAvailableKey(item.targetKey)
+            patch(item.id, { status: 'pending', progress: 0, error: '', targetKey: freeKey })
+            runQueue()
+        } catch (err) {
+            patch(item.id, { error: describeS3Error(err) })
+            toast.error(`Keep both failed: ${describeS3Error(err)}`)
+        }
+    }
+
+    function requeue(id, changes = {}) {
+        patch(id, { status: 'pending', progress: 0, error: '', ...changes })
+        runQueue()
+    }
+
+    function replaceAllConflicts() {
+        update(q => q.map(p => (p.status === 'conflict' ? { ...p, status: 'pending', progress: 0, error: '' } : p)))
+        runQueue()
+    }
+
+    function skipAllConflicts() {
+        update(q => q.map(p => (p.status === 'conflict' ? { ...p, status: 'skipped', error: '' } : p)))
+    }
+
+    function cancelItem(id) {
+        controllersRef.current.get(id)?.abort()
+        patch(id, { status: 'canceled' })
+    }
+
+    function cancelAllUploads() {
+        controllersRef.current.forEach(c => c.abort())
+        update(q => q.map(p => (p.status === 'pending' || p.status === 'uploading' ? { ...p, status: 'canceled' } : p)))
+    }
+
+    function clearAll() {
+        cancelAllUploads()
+        update(() => [])
+    }
 
     async function handleDrop(e) {
         e.preventDefault()
         e.stopPropagation()
         setIsDragging(false)
-
         const { items, files: dtFiles } = e.dataTransfer
-
-        // Prefer entries when available to support directories
-        const supportsEntries = items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function'
-        if (supportsEntries) {
-            const itemEntries = Array.from(items)
-                .filter((it) => it.kind === 'file')
-                .map((it) => it.webkitGetAsEntry())
-                .filter(Boolean)
-
-            const collectedArrays = await Promise.all(itemEntries.map((entry) => traverseFileTree(entry)))
-            const collectedFiles = collectedArrays.flat().map(f => ({ file: f, id: Math.random().toString(36).slice(2), progress: 0, status: 'pending', controller: null }))
-            await addFiles(collectedFiles)
-        } else {
-            const droppedFiles = Array.from(dtFiles).map(f => ({ file: f, id: Math.random().toString(36).slice(2), progress: 0, status: 'pending', controller: null }))
-            await addFiles(droppedFiles)
+        try {
+            const supportsEntries = items && items.length > 0 && typeof items[0].webkitGetAsEntry === 'function'
+            if (supportsEntries) {
+                const entries = Array.from(items)
+                    .filter((it) => it.kind === 'file')
+                    .map((it) => it.webkitGetAsEntry())
+                    .filter(Boolean)
+                const collected = await Promise.all(entries.map((entry) => traverseFileTree(entry)))
+                await addFiles(collected.flat())
+            } else {
+                await addFiles(Array.from(dtFiles || []))
+            }
+        } catch (err) {
+            toast.error(`Could not read the dropped files: ${err?.message || err}`)
         }
     }
 
     async function handleFileInput(e) {
-    const selectedFiles = Array.from(e.target.files).map(f => ({ file: f, id: Math.random().toString(36).slice(2), progress: 0, status: 'pending', controller: null }))
-    await addFiles(selectedFiles)
-    }
-
-    // Human readable bytes
-    function formatBytes(bytes) {
-        if (!bytes && bytes !== 0) return ''
-        const units = ['B', 'KB', 'MB', 'GB', 'TB']
-        let i = 0
-        let v = bytes
-        while (v >= 1024 && i < units.length - 1) {
-            v = v / 1024
-            i++
-        }
-        return `${Math.round(v * 10) / 10} ${units[i]}`
-    }
-
-    // keep ref in sync to avoid stale closures when checking queued files
-    useEffect(() => { filesRef.current = files }, [files])
-
-    // Add files with duplicate detection by original path/name and check S3 for existing objects
-    async function addFiles(newItems) {
-        // First dedupe against already queued files (use ref for up-to-date value)
-        const prevFilesSnapshot = filesRef.current || []
-        const existingPaths = new Set(prevFilesSnapshot.map(p => (p.file?.webkitRelativePath || p.file?.relativePath || p.file?.name)))
-        const unique = []
-        let localSkipped = 0
-        for (const it of newItems) {
-            const p = it.file?.webkitRelativePath || it.file?.relativePath || it.file?.name
-            if (!p) continue
-            if (existingPaths.has(p)) {
-                localSkipped++
-                continue
-            }
-            existingPaths.add(p)
-            unique.push(it)
-        }
-
-        // If no S3 client or credentials, just add unique items and warn that bucket couldn't be checked
-        if (!s3 || !credentials || !credentials.name) {
-            if (localSkipped > 0) toast.warning(`Skipped ${localSkipped} duplicate file(s) locally`)
-            setFiles(prev => [...prev, ...unique])
-            return
-        }
-
-        // Normalize currentDirectory similar to MultiPartUpload
-        let dir = currentDirectory.trim()
-        if (dir === "/") {
-            dir = ""
-        } else {
-            dir = dir.replace(/^\/+/, "").replace(/\/+$/, "") + "/"
-        }
-
-    const toAdd = []
-    const conflictItems = []
-    let existsConflicts = 0
-    const existsNames = []
-        // Optimize existence checks by listing S3 keys by prefix.
-        // Group files by their immediate prefix (to limit list scope).
-        const filesByPrefix = new Map()
-        for (const it of unique) {
-            const p = it.file?.webkitRelativePath || it.file?.relativePath || it.file?.name
-            if (!p) continue
-            // Use first path segment as grouping key to reduce list calls
-            const parts = p.split('/').filter(Boolean)
-            const group = parts.length > 1 ? parts[0] + '/' : ''
-            const fullKey = (dir + p).replace(/^\/+/, "")
-            if (!filesByPrefix.has(group)) filesByPrefix.set(group, [])
-            filesByPrefix.get(group).push({ item: it, relPath: p, fullKey })
-        }
-
-        // Fetch existing keys for each group in parallel with caching and pagination
-        const existingKeys = new Set()
-    const listPromises = Array.from(filesByPrefix.entries()).map(async ([group, list]) => {
-            // prefix to list on S3
-            const prefix = dir + group
-            // check cache first
-            if (listCacheRef.current.has(prefix)) {
-                const cached = listCacheRef.current.get(prefix)
-                cached.forEach(k => existingKeys.add(k))
-                return
-            }
-
-            const collected = []
-            let continuationToken = undefined
-            try {
-                while (true) {
-                    const res = await s3.send(new ListObjectsV2Command({ Bucket: credentials.name, Prefix: prefix, ContinuationToken: continuationToken }))
-                    const keys = (res.Contents || []).map(c => c.Key)
-                    keys.forEach(k => {
-                        collected.push(k)
-                        existingKeys.add(k)
-                    })
-                    if (!res.IsTruncated) break
-                    continuationToken = res.NextContinuationToken
-                }
-                // cache the collected keys for this prefix
-                listCacheRef.current.set(prefix, collected)
-            } catch (err) {
-                // If listing fails (permissions/network), fall back to per-file Head checks for this group
-                console.warn('ListObjectsV2 failed for prefix', prefix, err)
-                for (const entry of list) {
-                    try {
-                        await s3.send(new HeadObjectCommand({ Bucket: credentials.name, Key: entry.fullKey }))
-                        existingKeys.add(entry.fullKey)
-                    } catch (headErr) {
-                        const status = headErr?.$metadata?.httpStatusCode
-                        if (status === 404) {
-                            // not exists
-                        } else {
-                            existingKeys.add(entry.fullKey)
-                            console.warn('Could not confirm object existence via HEAD; treating as conflict:', entry.fullKey, headErr)
-                        }
-                    }
-                }
-            }
-        })
-
-        await Promise.all(listPromises)
-
-        // Now determine which files conflict based on collected existingKeys
-    for (const [group, list] of filesByPrefix.entries()) {
-            for (const entry of list) {
-                if (existingKeys.has(entry.fullKey)) {
-                    existsConflicts++
-                    existsNames.push(entry.relPath)
-            conflictItems.push({ ...entry.item, status: 'conflict', skipReason: 'exists', targetKey: entry.fullKey })
-                } else {
-            toAdd.push({ ...entry.item, targetKey: entry.fullKey })
-                }
-            }
-        }
-
-        // Update UI and warnings for duplicates/conflicts
-        if (localSkipped > 0) {
-            toast.warning(`${localSkipped} duplicate file(s) skipped locally`, { autoClose: 3000 })
-        }
-
-        if (toAdd.length > 0 || conflictItems.length > 0) {
-            setFiles(prev => [...toAdd.map(i => ({ ...i, status: 'pending' })), ...conflictItems, ...prev])
+        const selected = Array.from(e.target.files || [])
+        // Clear the input so selecting the same file again fires another change event.
+        e.target.value = ''
+        try {
+            await addFiles(selected)
+        } catch (err) {
+            toast.error(`Could not add files: ${describeS3Error(err)}`)
         }
     }
 
-    const removeFile = useCallback((index) => {
-        setFiles(prevFiles => prevFiles.filter((_, i) => i !== index))
-    }, [])
-
-    // Bulk actions for conflicts
-    const replaceAllConflicts = useCallback(() => {
-        setFiles(prev => prev.map(p => p.status === 'conflict' ? { ...p, status: 'pending', progress: 0, skipReason: undefined } : p))
-    }, [])
-
-    const skipAllConflicts = useCallback(() => {
-        setFiles(prev => prev.map(p => p.status === 'conflict' ? { ...p, status: 'skipped', skipReason: 'user-skip' } : p))
-    }, [])
-
-    function deriveKeepBothKey(originalKey) {
-        // Insert " (1)" before the extension, or append if none
-        const idx = originalKey.lastIndexOf('/')
-        const prefix = idx >= 0 ? originalKey.slice(0, idx + 1) : ''
-        const base = idx >= 0 ? originalKey.slice(idx + 1) : originalKey
-        const dot = base.lastIndexOf('.')
-        const name = dot > 0 ? base.slice(0, dot) : base
-        const ext = dot > 0 ? base.slice(dot) : ''
-        return `${prefix}${name} (1)${ext}`
+    const stop = (e) => {
+        e.preventDefault()
+        e.stopPropagation()
     }
-
-    async function pickAvailableKey(startKey) {
-        // Try startKey, then (1), (2), ... until free
-        if (!s3 || !credentials) return startKey
-        let key = startKey
-        let attempt = 1
-        while (true) {
-            try {
-                await s3.send(new HeadObjectCommand({ Bucket: credentials.name, Key: key }))
-                // exists -> bump index
-                const idx = key.lastIndexOf('/')
-                const prefix = idx >= 0 ? key.slice(0, idx + 1) : ''
-                const base = idx >= 0 ? key.slice(idx + 1) : key
-                const dot = base.lastIndexOf('.')
-                const name = dot > 0 ? base.slice(0, dot) : base
-                const ext = dot > 0 ? base.slice(dot) : ''
-                attempt += 1
-                key = `${prefix}${name} (${attempt})${ext}`
-            } catch (e) {
-                const code = e?.$metadata?.httpStatusCode
-                if (code === 404) return key
-                // On other errors, bail out and use the proposed key
-                return key
-            }
-        }
-    }
-
-    async function handleFilesUpload() {
-        setUploading(true)
-
-        // Process pending items until none remain. Using filesRef ensures we always read current queue.
-        while (true) {
-            const next = (filesRef.current || []).find(f => f.status === 'pending')
-            if (!next) break
-
-            const item = next
-            const controller = new AbortController()
-            setFiles(prev => prev.map((it) => it.id === item.id ? { ...it, controller, status: 'uploading', progress: 0 } : it))
-
-            const fileObj = item.file
-            const success = await MultiPartUpload(s3, fileObj, currentDirectory, credentials.name, {
-                onProgress: (uploaded, total) => {
-                    const pct = Math.round((uploaded / total) * 100)
-                    setFiles(prev => prev.map((it) => it.id === item.id ? { ...it, progress: pct } : it))
-                },
-                signal: controller.signal,
-                concurrency: 4,
-                targetKey: item.targetKey // may be keep-both or normal
-            })
-
-            if (!success) {
-                console.error(`Upload failed: ${fileObj.name}`)
-                // If the controller was aborted, mark as canceled, else error — check latest state by id
-                setFiles(prev => prev.map((it) => it.id === item.id ? { ...it, status: (it.controller && it.controller.signal && it.controller.signal.aborted) ? 'canceled' : 'error' } : it))
-                // continue processing remaining pending files
-                continue
-            }
-
-            setFiles(prev => prev.map((it) => it.id === item.id ? { ...it, status: 'done', progress: 100 } : it))
-            
-            // Remove the file after a short delay
-            setTimeout(() => {
-                setFiles(prev => prev.filter(p => p.id !== item.id))
-            }, 1500)
-        }
-
-    // Reset
-    setUploading(false)
-    }
-
-    function cancelAllUploads() {
-        setFiles(prev => prev.map((it) => {
-            if (it.controller && it.controller.abort && it.status === 'uploading') {
-                try { it.controller.abort() } catch { /* ignore */ }
-                return { ...it, status: 'canceled' }
-            }
-            return it
-        }))
-        setUploading(false)
-        
-    }
-
-    useEffect(() => {
-        if (files.length > 0 && !uploading) {
-            handleFilesUpload()
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [files])
 
     const borderColor = isDragging ? 'border-[#3a3a3a] bg-[#171717]' : 'border-[#252525] bg-[#101010]'
+    const conflictCount = files.filter(f => f.status === 'conflict').length
+
+    const statusLabel = (it) => ({
+        uploading: `${it.progress}%`,
+        done: 'Done',
+        error: 'Error',
+        canceled: 'Canceled',
+        skipped: 'Skipped',
+        conflict: 'Conflict',
+    }[it.status] || 'Pending')
+
+    // group files by top-level folder for a friendly view
+    const groups = new Map()
+    files.forEach(it => {
+        const parts = it.relPath.split('/').filter(Boolean)
+        const group = parts.length > 1 ? parts[0] : '_root'
+        const displayName = parts.length > 1 ? parts.slice(1).join('/') : it.relPath
+        if (!groups.has(group)) groups.set(group, [])
+        groups.get(group).push({ ...it, displayName })
+    })
 
     return (
         <div
+            data-testid='file-dropper'
             className={`w-full p-6 border-2 border-dashed rounded-lg transition-colors ${borderColor}`}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
+            onDragEnter={(e) => { stop(e); setIsDragging(true) }}
+            onDragLeave={(e) => { stop(e); setIsDragging(false) }}
+            onDragOver={stop}
             onDrop={handleDrop}
         >
-            <div className="flex flex-col items-center justify-center space-y-4">
-                <CloudUpload size={50} className='stroke-[1.5] text-gray-500' />
+            <div className='flex flex-col items-center justify-center space-y-4'>
+                <CloudUpload size={50} className='stroke-[1.5] text-gray-500' aria-hidden='true' />
 
-                <div className="text-center">
-                    <p className="font-mono text-sm text-gray-400">
+                <div className='text-center'>
+                    <p className='font-mono text-sm text-gray-400'>
                         {uploading
                             ? 'Uploading...'
                             : isDragging
                                 ? 'Drop files here'
                                 : 'Drag & drop files here, or click to select'}
                     </p>
-                    <p className="font-mono text-xs text-gray-600 mt-1">
+                    <p className='font-mono text-xs text-gray-600 mt-1'>
                         Supports multiple files and folders
                     </p>
                 </div>
 
-                <div className="flex items-center gap-2 flex-wrap justify-center">
-                    <label className="btn btn-ghost cursor-pointer">
+                <div className='flex items-center gap-2 flex-wrap justify-center'>
+                    <label className='btn btn-ghost cursor-pointer'>
                         <input
-                            type="file"
-                            className="hidden"
+                            type='file'
+                            className='hidden'
                             multiple
                             onChange={handleFileInput}
                             disabled={uploading}
+                            data-testid='file-input'
                         />
                         Select Files
                     </label>
-                    <label className="btn btn-ghost cursor-pointer">
+                    <label className='btn btn-ghost cursor-pointer'>
                         <input
-                            type="file"
-                            className="hidden"
+                            type='file'
+                            className='hidden'
+                            multiple
                             onChange={handleFileInput}
                             disabled={uploading}
-                            webkitdirectory=""
-                            mozdirectory=""
-                            directory=""
+                            webkitdirectory=''
+                            mozdirectory=''
+                            directory=''
+                            data-testid='folder-input'
                         />
                         Select Folder
                     </label>
                 </div>
             </div>
 
-                {files.length > 0 && (
-                <div className="mt-6 space-y-2">
-                    {/* Conflict Resolution UI */}
-                    {files.some(f => f.status === 'conflict') && (
-                        <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 mb-4 flex items-center gap-3">
-                            <div className="p-2 bg-yellow-500/20 rounded-lg">
-                                <AlertTriangle className="w-5 h-5 text-yellow-500" />
+            {files.length > 0 && (
+                <div className='mt-6 space-y-2'>
+                    {conflictCount > 0 && (
+                        <div role='status' className='bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4 mb-4 flex items-center gap-3'>
+                            <div className='p-2 bg-yellow-500/20 rounded-lg'>
+                                <TriangleAlert className='w-5 h-5 text-yellow-500' aria-hidden='true' />
                             </div>
                             <div>
-                                <h4 className="text-sm font-medium text-yellow-200">
+                                <h4 className='text-sm font-medium text-yellow-200'>
                                     Upload Conflicts
                                 </h4>
-                                <p className="text-xs text-yellow-500/80 mt-0.5">
-                                    {files.filter(f => f.status === 'conflict').length} file(s) already exist in this folder
+                                <p className='text-xs text-yellow-500/80 mt-0.5'>
+                                    {conflictCount} file(s) already exist in this folder
                                 </p>
                             </div>
                         </div>
                     )}
 
-                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className='flex items-center justify-between gap-2 flex-wrap'>
                         <div>
-                            <h5 className="font-mono text-sm text-gray-200">Upload queue</h5>
-                            <div className="font-mono text-xs text-gray-400">{`${files.filter(f => f.status === 'done').length}/${files.length} files uploaded`}</div>
+                            <h5 className='font-mono text-sm text-gray-200'>Upload queue</h5>
+                            <div className='font-mono text-xs text-gray-400'>{`${files.filter(f => f.status === 'done').length}/${files.length} files uploaded`}</div>
                         </div>
-                                <div className="flex items-center gap-2 flex-wrap">
-                                    <button onClick={() => setFiles([])} className="btn btn-ghost">Clear</button>
-                                    <button onClick={replaceAllConflicts} className="btn btn-ghost">Replace All</button>
-                                    <button onClick={skipAllConflicts} className="btn btn-ghost">Skip All</button>
-                                    <button onClick={() => setFiles(prev => prev.filter(p => p.status !== 'skipped' && p.status !== 'conflict'))} className="btn btn-ghost">Clear Skipped/Conflicts</button>
-                                    {uploading ? (
-                                        <button onClick={cancelAllUploads} className="btn btn-ghost text-red-400">Cancel All</button>
-                                    ) : (
-                                        <button onClick={handleFilesUpload} className="btn btn-primary">Upload Now</button>
-                                    )}
-                                </div>
+                        <div className='flex items-center gap-2 flex-wrap'>
+                            <button type='button' onClick={clearAll} className='btn btn-ghost'>Clear</button>
+                            <button type='button' onClick={replaceAllConflicts} className='btn btn-ghost' disabled={!conflictCount}>Replace All</button>
+                            <button type='button' onClick={skipAllConflicts} className='btn btn-ghost' disabled={!conflictCount}>Skip All</button>
+                            <button type='button' onClick={() => update(q => q.filter(p => p.status !== 'skipped' && p.status !== 'conflict'))} className='btn btn-ghost'>Clear Skipped/Conflicts</button>
+                            {uploading ? (
+                                <button type='button' onClick={cancelAllUploads} className='btn btn-ghost text-red-400'>Cancel All</button>
+                            ) : (
+                                <button type='button' onClick={runQueue} className='btn btn-primary'>Upload Now</button>
+                            )}
+                        </div>
                     </div>
 
-                    <div className="space-y-2 max-h-56 overflow-y-auto">
-                        {/* group files by top-level folder for a friendly view */}
-                        {(() => {
-                            const groups = new Map()
-                            files.forEach(it => {
-                                const rp = it.file.webkitRelativePath || it.file.relativePath || it.file.name
-                                const parts = rp.split('/').filter(Boolean)
-                                if (parts.length > 1) {
-                                    const g = parts[0]
-                                    const display = parts.slice(1).join('/')
-                                    if (!groups.has(g)) groups.set(g, [])
-                                    groups.get(g).push({ ...it, displayName: display, originalPath: rp })
-                                } else {
-                                    if (!groups.has('_root')) groups.set('_root', [])
-                                    groups.get('_root').push({ ...it, displayName: rp, originalPath: rp })
-                                }
-                            })
-
-                            return Array.from(groups.entries()).map(([groupName, items]) => (
-                                <div key={groupName} className="mb-2 border-b border-[#151515] pb-2">
-                                    {groupName !== '_root' && (
-                                        <div className="flex items-center gap-2 font-mono text-sm text-gray-300 mb-2">
-                                            <Folder size={16} className="text-yellow-400" />
-                                            <span>{groupName}</span>
-                                            <span className="text-xs text-gray-500">{`(${items.length})`}</span>
-                                        </div>
-                                    )}
-                                    {items.map((it) => (
-                                        <div
-                                            key={it.id}
-                                            className={`flex items-center justify-between p-2 rounded-md ${it.status === 'uploading' ? 'bg-green-900 border border-green-600' : 'card'}`}
-                                        >
-                                            <div className="flex items-center space-x-2 w-full">
-                                                <FileText size={16} className='text-gray-500' />
-                                                <div className="flex-1">
-                                                    <div className="flex items-center justify-between">
-                                                        <span className="font-mono text-xs text-gray-300 truncate max-w-[50vw] sm:max-w-xs">
-                                                            {it.displayName}
-                                                        </span>
-                                                        <div className="flex items-center gap-2">
-                                                            <span className="font-mono text-xs text-gray-400 ml-2">{formatBytes(it.file.size)}</span>
-                                                            <span className="font-mono text-xs text-gray-400 ml-2">
-                                                                {it.status === 'uploading' ? `${it.progress}%` : (it.status === 'done' ? 'Done' : (it.status === 'error' ? 'Error' : (it.status === 'canceled' ? 'Canceled' : (it.status === 'skipped' ? 'Skipped' : (it.status === 'conflict' ? 'Conflict' : 'Pending')))))}
-                                                            </span>
-                                                            {it.status === 'done' && <Check size={14} className='text-green-400' />}
-                                                            {it.status === 'uploading' && <LoaderCircle size={14} className='animate-spin text-yellow-400' />}
-                                                            {(it.status === 'error' || it.status === 'canceled') && <X size={14} className='text-red-400' />}
-                                                        </div>
-                                                    </div>
-                                                    <div className="h-1 bg-[#111] rounded mt-2 overflow-hidden">
-                                                        <div style={{ width: `${it.progress}%` }} className="h-1 bg-green-500 transition-all" />
+                    <div className='space-y-2 max-h-56 overflow-y-auto'>
+                        {Array.from(groups.entries()).map(([groupName, items]) => (
+                            <div key={groupName} className='mb-2 border-b border-[#151515] pb-2'>
+                                {groupName !== '_root' && (
+                                    <div className='flex items-center gap-2 font-mono text-sm text-gray-300 mb-2'>
+                                        <Folder size={16} className='text-yellow-400' aria-hidden='true' />
+                                        <span>{groupName}</span>
+                                        <span className='text-xs text-gray-500'>{`(${items.length})`}</span>
+                                    </div>
+                                )}
+                                {items.map((it) => (
+                                    <div
+                                        key={it.id}
+                                        data-testid='upload-item'
+                                        data-status={it.status}
+                                        data-name={it.relPath}
+                                        className={`flex items-center justify-between p-2 rounded-md ${it.status === 'uploading' ? 'bg-green-900 border border-green-600' : 'card'}`}
+                                    >
+                                        <div className='flex items-center space-x-2 w-full min-w-0'>
+                                            <FileText size={16} className='text-gray-500' aria-hidden='true' />
+                                            <div className='flex-1 min-w-0'>
+                                                <div className='flex items-center justify-between'>
+                                                    <span className='font-mono text-xs text-gray-300 truncate max-w-[50vw] sm:max-w-xs' title={it.targetKey}>
+                                                        {it.displayName}
+                                                    </span>
+                                                    <div className='flex items-center gap-2'>
+                                                        <span className='font-mono text-xs text-gray-400 ml-2'>{formatBytes(it.file.size)}</span>
+                                                        <span className='font-mono text-xs text-gray-400 ml-2'>{statusLabel(it)}</span>
+                                                        {it.status === 'done' && <Check size={14} className='text-green-400' aria-hidden='true' />}
+                                                        {it.status === 'uploading' && <LoaderCircle size={14} className='animate-spin text-yellow-400' aria-hidden='true' />}
+                                                        {(it.status === 'error' || it.status === 'canceled') && <X size={14} className='text-red-400' aria-hidden='true' />}
                                                     </div>
                                                 </div>
-                                            </div>
-
-                                            <div className="ml-3 flex items-center gap-2">
-                                                {it.status === 'uploading' && (
-                                                    <button onClick={() => {
-                                                        if (it.controller) it.controller.abort()
-                                                        setFiles(prev => prev.map((p) => p.id === it.id ? { ...p, status: 'canceled' } : p))
-                                                    }} className="btn btn-ghost">Cancel</button>
+                                                {it.error && (
+                                                    <div className={`font-mono text-[11px] mt-1 break-words ${it.status === 'error' ? 'text-red-400' : 'text-yellow-400'}`}>{it.error}</div>
                                                 )}
-                                                {it.status === 'error' && (
-                                                    <button onClick={() => {
-                                                        // mark pending to re-queue
-                                                        setFiles(prev => prev.map((p) => p.id === it.id ? { ...p, status: 'pending', progress: 0 } : p))
-                                                    }} className="btn btn-ghost">Retry</button>
-                                                )}
-                                                {it.status !== 'uploading' && it.status !== 'done' && it.status !== 'skipped' && it.status !== 'conflict' && (
-                                                    <button onClick={() => removeFile(files.findIndex(f => f.id === it.id))} className="text-gray-500 hover:text-gray-300">
-                                                        <X size={16} className='text-gray-500 cursor-pointer' />
-                                                    </button>
-                                                )}
-                                                {it.status === 'skipped' && (
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="text-xs text-yellow-300 font-mono">Skipped</span>
-                                                        <button onClick={() => setFiles(prev => prev.map(p => p.id === it.id ? { ...p, status: 'pending', progress: 0, skipReason: undefined } : p))} className="btn btn-ghost">Upload anyway</button>
-                                                    </div>
-                                                )}
-
-                                                {it.status === 'conflict' && (
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="text-xs text-yellow-300 font-mono">Conflict</span>
-                                                        <button onClick={async () => {
-                                                            // Replace: mark pending and set a flag to force upload (we'll reuse existing upload which overwrites by default)
-                                                            setFiles(prev => prev.map(p => p.id === it.id ? { ...p, status: 'pending', progress: 0, skipReason: undefined, /* keep same key to overwrite */ targetKey: it.targetKey } : p))
-                                                        }} className="btn btn-ghost">Replace</button>
-                                                        <button onClick={() => setFiles(prev => prev.map(p => p.id === it.id ? { ...p, status: 'skipped', skipReason: 'user-skip' } : p))} className="btn btn-ghost">Skip</button>
-                                                        <button onClick={async () => {
-                                                            // Keep both: compute a new available key and upload there
-                                                            const baseKey = deriveKeepBothKey(it.targetKey || '')
-                                                            const freeKey = await pickAvailableKey(baseKey)
-                                                            setFiles(prev => prev.map(p => p.id === it.id ? { ...p, status: 'pending', progress: 0, skipReason: undefined, targetKey: freeKey } : p))
-                                                        }} className="btn btn-ghost">Keep Both</button>
-                                                    </div>
-                                                )}
+                                                <div className='h-1 bg-[#111] rounded mt-2 overflow-hidden'>
+                                                    <div style={{ width: `${it.progress}%` }} className='h-1 bg-green-500 transition-all' />
+                                                </div>
                                             </div>
                                         </div>
-                                    ))}
-                                </div>
-                            ))
-                        })()}
+
+                                        <div className='ml-3 flex items-center gap-2'>
+                                            {it.status === 'uploading' && (
+                                                <button type='button' onClick={() => cancelItem(it.id)} className='btn btn-ghost'>Cancel</button>
+                                            )}
+                                            {(it.status === 'error' || it.status === 'canceled') && (
+                                                <button type='button' onClick={() => requeue(it.id)} className='btn btn-ghost'>Retry</button>
+                                            )}
+                                            {it.status !== 'uploading' && it.status !== 'done' && it.status !== 'skipped' && it.status !== 'conflict' && (
+                                                <button type='button' aria-label={`Remove ${it.relPath} from the queue`} onClick={() => update(q => q.filter(f => f.id !== it.id))} className='text-gray-500 hover:text-gray-300'>
+                                                    <X size={16} className='text-gray-500 cursor-pointer' aria-hidden='true' />
+                                                </button>
+                                            )}
+                                            {it.status === 'skipped' && (
+                                                <div className='flex items-center gap-2'>
+                                                    <span className='text-xs text-yellow-300 font-mono'>Skipped</span>
+                                                    <button type='button' onClick={() => requeue(it.id)} className='btn btn-ghost'>Upload anyway</button>
+                                                </div>
+                                            )}
+                                            {it.status === 'conflict' && (
+                                                <div className='flex items-center gap-2'>
+                                                    <span className='text-xs text-yellow-300 font-mono'>Conflict</span>
+                                                    <button type='button' onClick={() => requeue(it.id)} className='btn btn-ghost'>Replace</button>
+                                                    <button type='button' onClick={() => patch(it.id, { status: 'skipped', error: '' })} className='btn btn-ghost'>Skip</button>
+                                                    <button type='button' onClick={() => keepBoth(it)} className='btn btn-ghost'>Keep Both</button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        ))}
                     </div>
                 </div>
             )}

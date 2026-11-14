@@ -1,15 +1,7 @@
-import copyObjectOrFolder from './copyObjectOrFolder';
-import deleteFileOrFolder from './deleteFileOrFolder';
+import moveObjectOrFolder from './moveObjectOrFolder'
 
-export default async function renameFile(s3, oldKey, newKey, bucketName) {
-    if (!s3) throw new Error('S3 client is not initialized');
-    if (!oldKey || !newKey || oldKey === newKey) return true;
-    
-    // Copy to new location
-    await copyObjectOrFolder(s3, oldKey, newKey, bucketName);
-    
-    // Delete old file
-    await deleteFileOrFolder(s3, oldKey, bucketName);
-    
-    return true;
+/** Rename/move a file. Refuses to overwrite an existing object unless opts.overwrite. */
+export default async function renameFile(s3, oldKey, newKey, bucketName, opts = {}) {
+    if (!oldKey || !newKey || oldKey.endsWith('/') || newKey.endsWith('/')) throw new Error('Invalid file key')
+    return moveObjectOrFolder(s3, oldKey, newKey, bucketName, opts)
 }
