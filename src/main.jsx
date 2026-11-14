@@ -5,8 +5,11 @@ import { BrowserRouter } from 'react-router-dom'
 import CredentialsProvider from './context/CredentialsProvider.jsx'
 import { Bounce, ToastContainer } from 'react-toastify'
 
+// Served at '/' by default or under a sub-path (e.g. GitHub Pages) when built with VITE_BASE_PATH.
+const basename = import.meta.env.BASE_URL.replace(/\/+$/, '') || '/'
+
 createRoot(document.getElementById('root')).render(
-  <BrowserRouter>
+  <BrowserRouter basename={basename}>
     <CredentialsProvider>
       <App />
       <ToastContainer

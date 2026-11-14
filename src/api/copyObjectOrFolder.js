@@ -1,53 +1,48 @@
 import { CopyObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3'
+import { encodeCopySource, stripPrefix } from '../helpers/keys'
 
+/**
+ * Copy one object (key without trailing '/') or a whole folder (prefix ending with '/').
+ * Overwrites existing destination objects: callers check for conflicts first.
+ * Returns the number of objects copied.
+ */
 export default async function copyObjectOrFolder(s3, sourceKeyOrPrefix, destKeyOrPrefix, bucketName) {
-	if (!s3) throw new Error('S3 client not initialized')
-	if (!sourceKeyOrPrefix || !destKeyOrPrefix) return false
+    if (!s3) throw new Error('S3 client not initialized')
+    if (!sourceKeyOrPrefix || !destKeyOrPrefix) throw new Error('Source and destination are required')
+    if (sourceKeyOrPrefix === destKeyOrPrefix) return 0
 
-	// Prevent accidental self-copy loops
-	if (sourceKeyOrPrefix === destKeyOrPrefix) return true
+    const isFolder = sourceKeyOrPrefix.endsWith('/')
+    if (!isFolder) {
+        if (destKeyOrPrefix.endsWith('/')) throw new Error('Destination of a file copy must be a file key')
+        await s3.send(new CopyObjectCommand({
+            Bucket: bucketName,
+            CopySource: encodeCopySource(bucketName, sourceKeyOrPrefix),
+            Key: destKeyOrPrefix,
+        }))
+        return 1
+    }
 
-	const encodeCopySource = (key) => encodeURI(`${bucketName}/${key}`)
+    const srcPrefix = sourceKeyOrPrefix
+    const dstPrefix = destKeyOrPrefix.endsWith('/') ? destKeyOrPrefix : `${destKeyOrPrefix}/`
+    if (dstPrefix.startsWith(srcPrefix)) throw new Error('Destination cannot be inside the source folder')
 
-	const isFolder = sourceKeyOrPrefix.endsWith('/')
-	if (!isFolder) {
-		await s3.send(new CopyObjectCommand({
-			Bucket: bucketName,
-			CopySource: encodeCopySource(sourceKeyOrPrefix),
-			Key: destKeyOrPrefix
-		}))
-		return true
-	}
-
-	const srcPrefix = sourceKeyOrPrefix.endsWith('/') ? sourceKeyOrPrefix : sourceKeyOrPrefix + '/'
-	const dstPrefix = destKeyOrPrefix.endsWith('/') ? destKeyOrPrefix : destKeyOrPrefix + '/'
-
-	// Don't allow copying a folder into itself or a nested child of itself
-	if (dstPrefix.startsWith(srcPrefix)) {
-		throw new Error('Destination cannot be inside the source folder')
-	}
-
-	let continuationToken = undefined
-	while (true) {
-		const listRes = await s3.send(new ListObjectsV2Command({
-			Bucket: bucketName,
-			Prefix: srcPrefix,
-			ContinuationToken: continuationToken
-		}))
-		const contents = listRes.Contents || []
-		for (const obj of contents) {
-			const oldKey = obj.Key
-			const newKey = oldKey.replace(srcPrefix, dstPrefix)
-			await s3.send(new CopyObjectCommand({
-				Bucket: bucketName,
-				CopySource: encodeCopySource(oldKey),
-				Key: newKey
-			}))
-		}
-		if (!listRes.IsTruncated) break
-		continuationToken = listRes.NextContinuationToken
-	}
-	return true
+    let copied = 0
+    let continuationToken
+    do {
+        const listRes = await s3.send(new ListObjectsV2Command({
+            Bucket: bucketName,
+            Prefix: srcPrefix,
+            ContinuationToken: continuationToken,
+        }))
+        for (const obj of listRes.Contents || []) {
+            await s3.send(new CopyObjectCommand({
+                Bucket: bucketName,
+                CopySource: encodeCopySource(bucketName, obj.Key),
+                Key: dstPrefix + stripPrefix(obj.Key, srcPrefix),
+            }))
+            copied++
+        }
+        continuationToken = listRes.IsTruncated ? listRes.NextContinuationToken : undefined
+    } while (continuationToken)
+    return copied
 }
-
-

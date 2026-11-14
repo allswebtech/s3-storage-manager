@@ -1,10 +1,20 @@
 {
-  "name": "s3manager",
+  "name": "s3-storage-manager",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "S3 Storage Manager web UI built with React and Vite.",
+  "description": "Browser-only file manager for AWS S3 and S3-compatible storage, built with React and Vite.",
   "author": "Kevin Pareek <git@kevinpareek.com>",
+  "license": "MIT",
+  "homepage": "https://s3.allsweb.net/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allswebtech/s3-storage-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/allswebtech/s3-storage-manager/issues",
+    "email": "git@kevinpareek.com"
+  },
   "keywords": [
     "aws",
     "s3",
@@ -14,40 +24,45 @@
     "storage"
   ],
   "engines": {
-    "node": ">=20.0.0"
+    "node": "^22.13.0 || ^24.0.0 || >=26.0.0"
   },
-  "license": "MIT",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:pages": "vite build && node scripts/pages-postbuild.mjs",
+    "preview": "vite preview",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "headers": "node scripts/sync-headers.mjs",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "playwright test",
+    "s3:start": "bash scripts/s3-server.sh start",
+    "s3:stop": "bash scripts/s3-server.sh stop"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.948.0",
-    "@aws-sdk/s3-request-presigner": "^3.948.0",
-    "@tailwindcss/vite": "^4.1.18",
-    "axios": "^1.13.2",
-    "jszip": "^3.10.1",
-    "lucide-react": "^0.561.0",
-    "react": "^19.2.3",
-    "react-dom": "^19.2.3",
-    "react-router-dom": "^7.10.1",
-    "react-toastify": "^11.0.5",
-    "tailwindcss": "^4.1.18"
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/s3-request-presigner": "^3.1169.0",
+    "jszip": "^3.10.2",
+    "lucide-react": "^1.72.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.5",
+    "react-toastify": "^11.2.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.1",
-    "@types/react": "^19.2.7",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.2",
-    "eslint": "^9.39.1",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.4.24",
-    "globals": "^16.5.0",
-    "vite": "^7.2.7"
-  },
-  "bugs": {
-    "email": "git@kevinpareek.com"
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "1.65.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "eslint": "^10.15.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.7",
+    "globals": "^17.14.0",
+    "tailwindcss": "^4.3.5",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
   }
 }

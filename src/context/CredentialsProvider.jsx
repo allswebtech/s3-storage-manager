@@ -1,94 +1,120 @@
-import { S3Client } from "@aws-sdk/client-s3";
-import { createContext, useEffect, useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { toast } from 'react-toastify'
+import createS3Client from '../api/s3Client'
+import { credentialsContext } from './credentialsContext'
+import {
+    clearAllStoredState,
+    credentialId,
+    forgetDirectory,
+    loadCredentials,
+    loadSelectedIndex,
+    normalizeCredential,
+    saveCredentials,
+    saveSelectedIndex,
+} from '../helpers/credentials'
 
-export const credentialsContext = createContext({
-    s3: null,
-    credentials: null,
-    credentialsList: [],
-    selectedCredentialIndex: 0,
-    setSelectedCredentialIndex: () => {},
-    setCredentialsList: () => {},
-});
+function initialState() {
+    const { list, invalidCount } = loadCredentials()
+    return { list, invalidCount, index: loadSelectedIndex(list.length) }
+}
 
 export default function CredentialsProvider({ children }) {
-    const [credentialsList, setCredentialsList] = useState([]);
-    const [selectedCredentialIndex, setSelectedCredentialIndex] = useState(0);
-    const navigate = useNavigate();
+    const [init] = useState(initialState)
+    const [credentialsList, setCredentialsList] = useState(init.list)
+    const [selectedCredentialIndex, setSelectedIndexState] = useState(init.index)
+    const navigate = useNavigate()
+    const location = useLocation()
+    const warnedRef = useRef(false)
 
     useEffect(() => {
-        const stored = localStorage.getItem("credentials");
-        if (!stored) {
-            console.error("No credentials found in localStorage");
-            navigate('/config');
-            return;
+        if (init.invalidCount > 0 && !warnedRef.current) {
+            warnedRef.current = true
+            toast.warning(`${init.invalidCount} saved credential(s) are incomplete and were ignored`)
         }
+    }, [init.invalidCount])
 
-        try {
-            let parsed = JSON.parse(stored);
-            let credsArray = [];
-            if (Array.isArray(parsed)) {
-                credsArray = parsed;
-            } else if (parsed && typeof parsed === 'object') {
-                credsArray = [parsed];
-            }
-            // Validate all credentials
-            const valid = credsArray.every(c => c.region && c.access_key && c.secret_key && c.name && c.endpoint);
-            if (!valid || credsArray.length === 0) {
-                console.error("Incomplete credentials found in localStorage");
-                navigate('/config');
-                return;
-            }
-            setCredentialsList(credsArray);
-
-            const storedIndex = localStorage.getItem("selectedCredentialIndex");
-            if (storedIndex !== null) {
-                const index = parseInt(storedIndex, 10);
-                if (index >= 0 && index < credsArray.length) {
-                    setSelectedCredentialIndex(index);
-                }
-            }
-        } catch (err) {
-            console.error("Invalid credentials in localStorage", err);
-            navigate('/config');
+    // Without a usable credential only the configuration page makes sense.
+    useEffect(() => {
+        if (!credentialsList.length && location.pathname !== '/config') {
+            navigate('/config', { replace: true })
         }
-    }, [navigate]);
+    }, [credentialsList.length, location.pathname, navigate])
 
-    // Update S3 client when credentialsList or selectedCredentialIndex changes
-    const s3 = useMemo(() => {
-        if (!credentialsList.length) return null;
-        const cred = credentialsList[selectedCredentialIndex] || credentialsList[0];
-        if (!cred) return null;
-        const { region, access_key, secret_key, endpoint } = cred;
-        return new S3Client({
-            region,
-            endpoint,
-            forcePathStyle: true,
-            credentials: {
-                accessKeyId: access_key,
-                secretAccessKey: secret_key
-            }
-        });
-    }, [credentialsList, selectedCredentialIndex]);
+    const index = selectedCredentialIndex < credentialsList.length ? selectedCredentialIndex : 0
+    const credentials = credentialsList[index] || null
 
-    const handleSetSelectedCredentialIndex = (index) => {
-        setSelectedCredentialIndex(index);
-        localStorage.setItem("selectedCredentialIndex", index);
-    };
+    const s3 = useMemo(() => (credentials ? createS3Client(credentials) : null), [credentials])
+    useEffect(() => () => { try { s3?.destroy() } catch { /* ignore */ } }, [s3])
 
-    const credentials = credentialsList[selectedCredentialIndex] || null;
-    const values = {
+    const setSelectedCredentialIndex = useCallback((i) => {
+        setSelectedIndexState(i)
+        saveSelectedIndex(i)
+    }, [])
+
+    /** Add a credential (or select the identical one already saved). Returns its index. */
+    const addCredential = useCallback((cred) => {
+        const c = normalizeCredential(cred)
+        const existing = credentialsList.findIndex(x => credentialId(x) === credentialId(c) && x.access_key === c.access_key)
+        let next
+        let idx = existing
+        if (existing >= 0) {
+            next = credentialsList.map((x, i) => (i === existing ? { ...x, ...c } : x))
+        } else {
+            next = [...credentialsList, c]
+            idx = next.length - 1
+        }
+        saveCredentials(next)
+        setCredentialsList(next)
+        setSelectedCredentialIndex(idx)
+        return idx
+    }, [credentialsList, setSelectedCredentialIndex])
+
+    const updateCredential = useCallback((i, cred) => {
+        const c = normalizeCredential(cred)
+        const prev = credentialsList[i]
+        if (!prev) throw new Error('Credential not found')
+        // Spread prev first so fields this version does not know about are kept.
+        const merged = { ...prev, ...c }
+        if (!cred.publicUrl) delete merged.publicUrl
+        const next = credentialsList.map((x, j) => (j === i ? merged : x))
+        if (credentialId(prev) !== credentialId(merged)) forgetDirectory(prev)
+        saveCredentials(next)
+        setCredentialsList(next)
+    }, [credentialsList])
+
+    const removeCredential = useCallback((i) => {
+        const prev = credentialsList[i]
+        if (!prev) return
+        const next = credentialsList.filter((_, j) => j !== i)
+        forgetDirectory(prev)
+        saveCredentials(next)
+        setCredentialsList(next)
+        const sel = i < index ? index - 1 : (i === index ? 0 : index)
+        setSelectedCredentialIndex(Math.max(0, Math.min(sel, next.length - 1)))
+    }, [credentialsList, index, setSelectedCredentialIndex])
+
+    const removeAllCredentials = useCallback(() => {
+        clearAllStoredState()
+        setCredentialsList([])
+        setSelectedIndexState(0)
+    }, [])
+
+    const value = useMemo(() => ({
         s3,
         credentials,
         credentialsList,
-        selectedCredentialIndex,
-        setSelectedCredentialIndex: handleSetSelectedCredentialIndex,
-        setCredentialsList,
-    };
+        selectedCredentialIndex: index,
+        setSelectedCredentialIndex,
+        addCredential,
+        updateCredential,
+        removeCredential,
+        removeAllCredentials,
+    }), [s3, credentials, credentialsList, index, setSelectedCredentialIndex, addCredential, updateCredential, removeCredential, removeAllCredentials])
 
     return (
-        <credentialsContext.Provider value={values}>
+        <credentialsContext.Provider value={value}>
             {children}
         </credentialsContext.Provider>
-    );
+    )
 }

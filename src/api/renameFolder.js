@@ -1,21 +1,9 @@
-import copyObjectOrFolder from './copyObjectOrFolder';
-import deleteFileOrFolder from './deleteFileOrFolder';
+import moveObjectOrFolder from './moveObjectOrFolder'
 
-export default async function renameFolder(s3, oldPrefix, newPrefix, bucketName) {
-    if (!s3) throw new Error('S3 client is not initialized');
-    if (!oldPrefix || !newPrefix) return false;
-
-    // Normalize prefixes to ensure they end with '/'
-    const normOld = oldPrefix.endsWith('/') ? oldPrefix : oldPrefix + '/';
-    const normNew = newPrefix.endsWith('/') ? newPrefix : newPrefix + '/';
-
-    if (normOld === normNew) return true;
-
-    // Copy all objects from old prefix to new prefix
-    await copyObjectOrFolder(s3, normOld, normNew, bucketName);
-
-    // Delete all objects in old prefix
-    await deleteFileOrFolder(s3, normOld, bucketName);
-
-    return true;
+/** Rename/move a folder (all objects under the prefix). Refuses to merge into an existing folder. */
+export default async function renameFolder(s3, oldPrefix, newPrefix, bucketName, opts = {}) {
+    if (!oldPrefix || !newPrefix) throw new Error('Invalid folder')
+    const normOld = oldPrefix.endsWith('/') ? oldPrefix : `${oldPrefix}/`
+    const normNew = newPrefix.endsWith('/') ? newPrefix : `${newPrefix}/`
+    return moveObjectOrFolder(s3, normOld, normNew, bucketName, opts)
 }

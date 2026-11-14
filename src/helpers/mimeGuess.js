@@ -63,3 +63,16 @@ export function fileCategory(name) {
   if (isDocument(n) || isPDF(n) || isCSV(n) || isMarkdown(n) || isTextLike(n)) return 'document'
   return 'other'
 }
+
+// How the preview modal shows a file: image | video | audio | pdf | json | csv | markdown | text | download
+export function previewMode(name = '') {
+  if (isImage(name)) return 'image'
+  if (isVideo(name)) return 'video'
+  if (isAudio(name)) return 'audio'
+  if (isPDF(name)) return 'pdf'
+  if (extOf(name) === 'json') return 'json'
+  if (isCSV(name)) return 'csv'
+  if (isMarkdown(name)) return 'markdown'
+  if (isTextLike(name)) return 'text'
+  return 'download'
+}

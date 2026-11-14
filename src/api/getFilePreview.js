@@ -1,36 +1,28 @@
-import { GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { GetObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
+import { baseName, encodeKeyPath } from '../helpers/keys'
+import { contentDisposition } from '../helpers/contentDisposition'
+import { safeHttpUrl } from '../helpers/url'
 
-// Generate a URL for viewing/downloading a key.
-// Rules:
-// - If publicBaseUrl is provided AND download === false -> return `${publicBaseUrl}/${encodedKey}`
-// - For download === true -> always return a signed URL (more reliable across CDNs)
-export default async function getFilePreview(s3, key, download = false, bucketName = "", publicBaseUrl = "") {
-    if (!s3) throw new Error('S3 client is not initialized');
-    
-    // Prefer public base URL only for non-download views
-    if (publicBaseUrl && !download) {
-        const base = String(publicBaseUrl).replace(/\/+$/, '');
-        const k = String(key || '');
-        const encodedKey = k.split('/').map(encodeURIComponent).join('/');
-        return `${base}/${encodedKey}`;
+/**
+ * URL to view or download a key.
+ * - View (download === false) with a valid http(s) public base URL: `${publicBaseUrl}/${encodedKey}`.
+ * - Otherwise a presigned GET URL (1 hour). Downloads are always signed and carry a
+ *   Content-Disposition with the object's own file name (ASCII fallback + RFC 5987 UTF-8 name).
+ */
+export default async function getFilePreview(s3, key, download = false, bucketName = '', publicBaseUrl = '', { expiresIn = 3600 } = {}) {
+    if (!s3) throw new Error('S3 client is not initialized')
+    if (!key) throw new Error('Key is required')
+
+    const base = safeHttpUrl(publicBaseUrl)
+    if (base && !download) {
+        return `${base.replace(/\/+$/, '')}/${encodeKeyPath(key)}`
     }
-
-    // Derive a clean filename for download disposition to avoid including full paths
-    const safeName = (() => {
-        const parts = String(key || '').split('/').filter(Boolean);
-        const last = parts[parts.length - 1] || 'file';
-        return encodeURIComponent(last).replace(/%20/g, ' ');
-    })();
 
     const command = new GetObjectCommand({
         Bucket: bucketName,
         Key: key,
-        ...(download && {
-            ResponseContentDisposition: `attachment; filename="${safeName}"`,
-        }),
-    });
-
-    const url = await getSignedUrl(s3, command, { expiresIn: 3600 });
-    return url;
+        ...(download && { ResponseContentDisposition: contentDisposition(baseName(key) || 'file') }),
+    })
+    return getSignedUrl(s3, command, { expiresIn })
 }

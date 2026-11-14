@@ -1,48 +1,48 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import useCredentials from '../hooks/useCredentials'
-import { S3Client } from '@aws-sdk/client-s3'
-import listFiles from '../api/listFiles'
 import { toast } from 'react-toastify'
 import SimpleHeader from '../components/SimpleHeader'
+import verifyCredential from '../api/verifyCredential'
+import { describeS3Error } from '../api/s3Client'
+import { normalizeCredential, validateCredential } from '../helpers/credentials'
+
+const EMPTY_FORM = {
+    name: '',
+    secret_key: '',
+    access_key: '',
+    region: '',
+    endpoint: '',
+    publicUrl: ''
+}
+
+// CORS rule the bucket needs for this app. It is scoped to the origin the app is served from;
+// "*" would let any website use the bucket's CORS grant from a visitor's browser.
+function buildCorsJson(origin) {
+    return JSON.stringify([
+        {
+            AllowedHeaders: ['*'],
+            AllowedMethods: ['GET', 'PUT', 'POST', 'DELETE', 'HEAD'],
+            AllowedOrigins: [origin],
+            ExposeHeaders: ['ETag'],
+            MaxAgeSeconds: 3000
+        }
+    ], null, 4)
+}
 
 export default function ConfigurationForm() {
 
-    const [formData, setFormData] = useState({
-        name: '',
-        secret_key: '',
-        access_key: '',
-        region: '',
-    endpoint: '',
-    publicUrl: ''
-    })
-    const { setCredentialsList } = useCredentials()
+    const [formData, setFormData] = useState(EMPTY_FORM)
+    const [errors, setErrors] = useState({})
+    const [submitting, setSubmitting] = useState(false)
+    const { addCredential, credentialsList } = useCredentials()
     const navigate = useNavigate()
     const [copiedKey, setCopiedKey] = useState(null)
     const [selectedProvider, setSelectedProvider] = useState('aws')
     const [providerSearch, setProviderSearch] = useState('')
 
-    const corsJson = `[
-    {
-        "AllowedHeaders": [
-            "*"
-        ],
-        "AllowedMethods": [
-            "GET",
-            "PUT",
-            "POST",
-            "DELETE",
-            "HEAD"
-        ],
-        "AllowedOrigins": [
-            "*"
-        ],
-        "ExposeHeaders": [
-            "ETag"
-        ],
-        "MaxAgeSeconds": 3000
-    }
-]`
+    const appOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://your-app.example.com'
+    const corsJson = buildCorsJson(appOrigin)
 
     const r2EndpointTemplate = 'https://<accountid>.r2.cloudflarestorage.com'
     const r2Region = 'auto'
@@ -52,8 +52,8 @@ export default function ConfigurationForm() {
             await navigator.clipboard.writeText(text)
             setCopiedKey(id)
             setTimeout(() => setCopiedKey(null), 1500)
-        } catch (err) {
-            console.error('Failed to copy', err)
+        } catch {
+            toast.error('Could not copy to the clipboard')
         }
     }
 
@@ -63,7 +63,7 @@ export default function ConfigurationForm() {
             region: providerMeta.region || prev.region,
             endpoint: providerMeta.endpoint || prev.endpoint
         }))
-        try { toast.success('Applied provider values to form') } catch {}
+        toast.success('Applied provider values to form')
     }
 
     const providers = [
@@ -141,84 +141,45 @@ export default function ConfigurationForm() {
         }
     ]
 
+    function setField(field, value) {
+        setFormData(prev => ({ ...prev, [field]: value }))
+        setErrors(prev => {
+            if (!prev[field]) return prev
+            const next = { ...prev }
+            delete next[field]
+            return next
+        })
+    }
+
     async function handleSubmit(event) {
         event.preventDefault()
+        if (submitting) return
 
-        if (
-            !formData.name ||
-            !formData.access_key ||
-            !formData.secret_key ||
-            !formData.region ||
-            !formData.endpoint
-        ) {
-            alert("All fields are required")
+        const candidate = normalizeCredential(formData)
+        const fieldErrors = validateCredential(candidate)
+        setErrors(fieldErrors)
+        if (Object.keys(fieldErrors).length) {
+            toast.error('Please fix the highlighted fields')
             return
         }
+        setSubmitting(true)
         try {
-            const tempClient = new S3Client({
-                region: formData.region,
-                endpoint: formData.endpoint,
-                forcePathStyle: true,
-                credentials: {
-                    accessKeyId: formData.access_key,
-                    secretAccessKey: formData.secret_key
-                }
-            })
-            
-            const res = await listFiles(tempClient, '', formData.name)
-            if (!res || !Array.isArray(res.items)) throw new Error('Bucket not accessible')
-
-            // Merge with existing credentials in localStorage
-            const stored = localStorage.getItem('credentials')
-            let newStored
-            if (!stored) {
-                newStored = formData
-            } else {
-                try {
-                    const parsed = JSON.parse(stored)
-                    if (Array.isArray(parsed)) {
-                        newStored = [...parsed, formData]
-                    } else if (parsed && typeof parsed === 'object') {
-                        newStored = [parsed, formData]
-                    } else {
-                        newStored = formData
-                    }
-                } catch (err) {
-                    newStored = formData
-                }
-            }
-
-            localStorage.setItem("credentials", JSON.stringify(newStored))
-            // update context state if available
-            if (setCredentialsList) {
-                if (Array.isArray(newStored)) setCredentialsList(newStored)
-                else setCredentialsList([newStored])
-            }
-
-            toast.success("Authorization successfull")
-            setFormData({
-                name: '',
-                secret_key: '',
-                access_key: '',
-                region: '',
-                endpoint: '',
-                publicUrl: ''
-            })
-            return navigate('/')
-
+            await verifyCredential(candidate)
         } catch (error) {
-            console.error(error)
-            toast.error("Please enter valid credentials")
-            setFormData({
-                name: '',
-                secret_key: '',
-                access_key: '',
-                region: '',
-                endpoint: '',
-                publicUrl: ''
-            })
+            // Keep what the user typed so a typo can be fixed without re-entering the keys.
+            toast.error(`Could not connect: ${describeS3Error(error)}`)
+            setSubmitting(false)
             return
         }
+        addCredential(candidate)
+        setSubmitting(false)
+        toast.success('Connected')
+        setFormData(EMPTY_FORM)
+        navigate('/')
+    }
+
+    function fieldError(field) {
+        return errors[field] ? <span id={`${field}-error`} role='alert' className='text-[11px] text-red-400'>{errors[field]}</span> : null
     }
 
     // Allow opening /config even when credentials exist (used for adding new credentials)
@@ -232,46 +193,57 @@ export default function ConfigurationForm() {
                         Enter your S3 Configurations
                     </h1>
 
-                    <form onSubmit={handleSubmit} className='space-y-3'>
+                    <form onSubmit={handleSubmit} className='space-y-3' noValidate>
                         
                         <div className='flex flex-col items-start gap-1'>
-                            <label htmlFor="name" className='text-sm text-gray-400'>
+                            <label htmlFor="access_key" className='text-sm text-gray-400'>
                                 Access Key
                             </label>
                             <input
+                                id='access_key'
                                 type="password"
                                 name='access_key'
+                                autoComplete='off'
+                                aria-invalid={Boolean(errors.access_key)}
                                 value={formData.access_key}
-                                onChange={(e) => setFormData({ ...formData, access_key: e.target.value })}
+                                onChange={(e) => setField('access_key', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='••••••••••••'
                             />
+                            {fieldError('access_key')}
                         </div>
                         <div className='flex flex-col items-start gap-1'>
-                            <label htmlFor="name" className='text-sm text-gray-400'>
+                            <label htmlFor="secret_key" className='text-sm text-gray-400'>
                                 Secret Key
                             </label>
                             <input
+                                id='secret_key'
                                 type="password"
                                 name='secret_key'
+                                autoComplete='off'
+                                aria-invalid={Boolean(errors.secret_key)}
                                 value={formData.secret_key}
-                                onChange={(e) => setFormData({ ...formData, secret_key: e.target.value })}
+                                onChange={(e) => setField('secret_key', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='••••••••••••'
                             />
+                            {fieldError('secret_key')}
                         </div>
                         <div className='flex flex-col items-start gap-1'>
                             <label htmlFor="region" className='text-sm text-gray-400'>
                                 Region
                             </label>
                             <input
+                                id='region'
                                 type="text"
                                 name='region'
+                                aria-invalid={Boolean(errors.region)}
                                 value={formData.region}
-                                onChange={(e) => setFormData({ ...formData, region: e.target.value })}
+                                onChange={(e) => setField('region', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='eg. eu-north-1'
                             />
+                            {fieldError('region')}
                         </div>
 
                         <div className='flex flex-col items-start gap-1'>
@@ -279,14 +251,17 @@ export default function ConfigurationForm() {
                                 Bucket Name
                             </label>
                             <input
+                                id='name'
                                 type="text"
                                 name='name'
+                                aria-invalid={Boolean(errors.name)}
                                 value={formData.name}
-                                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                                onChange={(e) => setField('name', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='eg. bucketname'
                                 autoFocus
                             />
+                            {fieldError('name')}
                         </div>
 
                         <div className='flex flex-col items-start gap-1'>
@@ -294,31 +269,42 @@ export default function ConfigurationForm() {
                                 Endpoint
                             </label>
                             <input
-                                type="text"
+                                id='endpoint'
+                                type="url"
                                 name='endpoint'
+                                aria-invalid={Boolean(errors.endpoint)}
                                 value={formData.endpoint}
-                                onChange={(e) => setFormData({ ...formData, endpoint: e.target.value })}
+                                onChange={(e) => setField('endpoint', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='eg. https://s3.amazonaws.com or https://nyc3.digitaloceanspaces.com'
                             />
+                            {fieldError('endpoint')}
                         </div>
                         <div className='flex flex-col items-start gap-1'>
                             <label htmlFor="publicUrl" className='text-sm text-gray-400'>
                                 Public Base URL (optional)
                             </label>
                             <input
-                                type="text"
+                                id='publicUrl'
+                                type="url"
                                 name='publicUrl'
+                                aria-invalid={Boolean(errors.publicUrl)}
                                 value={formData.publicUrl}
-                                onChange={(e) => setFormData({ ...formData, publicUrl: e.target.value })}
+                                onChange={(e) => setField('publicUrl', e.target.value)}
                                 className='input w-full text-sm'
                                 placeholder='eg. https://cdn.example.com/bucket (no trailing slash)'
                             />
-                            <span className='text-[11px] text-gray-500 mt-1'>If set, View/Download/Preview links will use this base instead of signed URLs.</span>
+                            {fieldError('publicUrl')}
+                            <span className='text-[11px] text-gray-500 mt-1'>If set, View and Preview links use this base instead of signed URLs. Downloads are always signed.</span>
                         </div>
-                        <button type='submit' className='btn btn-primary w-full text-sm mt-4'>
-                            Connect
+                        <button type='submit' className='btn btn-primary w-full text-sm mt-4' disabled={submitting}>
+                            {submitting ? 'Connecting…' : 'Connect'}
                         </button>
+                        {credentialsList.length > 0 && (
+                            <button type='button' onClick={() => navigate('/')} className='btn btn-ghost w-full text-sm'>
+                                Cancel
+                            </button>
+                        )}
                     </form>
                 </div>
                 
@@ -410,7 +396,7 @@ export default function ConfigurationForm() {
                             <pre className='text-xs overflow-x-auto p-3 mt-2 text-gray-200'>
 {corsJson}
                             </pre>
-                            <p className='text-[11px] text-gray-400 px-1 pt-1'>Note: For restricted domains, you can set AllowedOrigins: ["https://yourdomain.com"].</p>
+                            <p className='text-[11px] text-gray-400 px-1 pt-1'>AllowedOrigins is set to the address this app is served from ({appOrigin}). Avoid "*": it lets any website use this CORS rule from a visitor&apos;s browser. ExposeHeaders must include ETag for multipart uploads.</p>
                         </div>
                     </div>
                 </div>

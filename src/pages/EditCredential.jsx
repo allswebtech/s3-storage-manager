@@ -1,113 +1,116 @@
-import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import useCredentials from '../hooks/useCredentials';
-import { toast } from 'react-toastify';
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import useCredentials from '../hooks/useCredentials'
+import { toast } from 'react-toastify'
+import verifyCredential from '../api/verifyCredential'
+import { describeS3Error } from '../api/s3Client'
+import { normalizeCredential, validateCredential } from '../helpers/credentials'
+
+function toForm(c) {
+	return {
+		name: c?.name || '',
+		access_key: c?.access_key || '',
+		secret_key: c?.secret_key || '',
+		region: c?.region || '',
+		endpoint: c?.endpoint || '',
+		publicUrl: c?.publicUrl || ''
+	}
+}
+
+const FIELDS = [
+	{ name: 'access_key', placeholder: 'Access Key', type: 'text' },
+	{ name: 'secret_key', placeholder: 'Secret Key', type: 'password' },
+	{ name: 'region', placeholder: 'Region', type: 'text' },
+	{ name: 'name', placeholder: 'Bucket Name', type: 'text' },
+	{ name: 'endpoint', placeholder: 'Endpoint', type: 'url' },
+	{ name: 'publicUrl', placeholder: 'Public Base URL (optional)', type: 'url' },
+]
 
 export default function EditCredential() {
-	const { credentials, credentialsList, selectedCredentialIndex, setCredentialsList, setSelectedCredentialIndex } = useCredentials();
-	const navigate = useNavigate();
-	const [formData, setFormData] = useState({
-		name: '',
-		access_key: '',
-		secret_key: '',
-		region: '',
-		endpoint: '',
-		publicUrl: ''
-	});
-
-	useEffect(() => {
-		if (credentials) {
-			setFormData({
-				name: credentials.name || '',
-				access_key: credentials.access_key || '',
-				secret_key: credentials.secret_key || '',
-				region: credentials.region || '',
-				endpoint: credentials.endpoint || '',
-				publicUrl: credentials.publicUrl || ''
-			});
-		}
-	}, [credentials]);
+	const { credentials, selectedCredentialIndex, updateCredential, removeCredential, credentialsList } = useCredentials()
+	// The page is keyed by the selected credential (see App.jsx), so this initial value is always current.
+	const [formData, setFormData] = useState(() => toForm(credentials))
+	const [errors, setErrors] = useState({})
+	const [saving, setSaving] = useState(false)
+	const navigate = useNavigate()
 
 	function handleChange(e) {
-		setFormData({ ...formData, [e.target.name]: e.target.value });
+		const { name, value } = e.target
+		setFormData(prev => ({ ...prev, [name]: value }))
+		setErrors(prev => {
+			if (!prev[name]) return prev
+			const next = { ...prev }
+			delete next[name]
+			return next
+		})
 	}
 
-	function handleSubmit(e) {
-		e.preventDefault();
-		if (!formData.name || !formData.access_key || !formData.secret_key || !formData.region || !formData.endpoint) {
-			toast.error('All fields are required');
-			return;
+	async function handleSubmit(e) {
+		e.preventDefault()
+		if (saving || !credentials) return
+		const candidate = normalizeCredential(formData)
+		const fieldErrors = validateCredential(candidate)
+		setErrors(fieldErrors)
+		if (Object.keys(fieldErrors).length) {
+			toast.error('Please fix the highlighted fields')
+			return
 		}
-		// Preserve existing credentials and replace only the selected one
+		setSaving(true)
 		try {
-			let stored = localStorage.getItem('credentials');
-			let newList = [];
-			if (Array.isArray(credentialsList) && credentialsList.length) {
-				// Use list from context as the source of truth
-				newList = [...credentialsList];
-				newList[selectedCredentialIndex] = { ...formData };
-			} else if (stored) {
-				// Fallback to localStorage parsing
-				const parsed = JSON.parse(stored);
-				if (Array.isArray(parsed)) {
-					newList = [...parsed];
-					newList[selectedCredentialIndex] = { ...formData };
-				} else if (parsed && typeof parsed === 'object') {
-					newList = [{ ...formData }];
-				}
-			} else {
-				newList = [{ ...formData }];
-			}
-
-			localStorage.setItem('credentials', JSON.stringify(newList));
-			if (setCredentialsList) setCredentialsList(newList);
-			toast.success('Credentials updated!');
-			setTimeout(() => navigate('/'), 800);
+			await verifyCredential(candidate)
 		} catch (err) {
-			console.error('Failed to update credentials', err);
-			toast.error('Failed to update credentials');
+			toast.error(`Could not connect: ${describeS3Error(err)}`)
+			setSaving(false)
+			return
+		}
+		try {
+			updateCredential(selectedCredentialIndex, candidate)
+			toast.success('Credentials updated!')
+			navigate('/')
+		} catch {
+			toast.error('Failed to update credentials')
+		} finally {
+			setSaving(false)
 		}
 	}
 
 	function handleDelete() {
-		if (!confirm('Delete this credential? This cannot be undone.')) return;
-
-		// if credentialsList has multiple entries, remove selected index
-		if (Array.isArray(credentialsList) && credentialsList.length > 1) {
-			const newList = credentialsList.filter((_, i) => i !== selectedCredentialIndex);
-			localStorage.setItem('credentials', JSON.stringify(newList));
-			if (setCredentialsList) setCredentialsList(newList);
-			// reset selected index if needed
-			if (selectedCredentialIndex >= newList.length) setSelectedCredentialIndex(0);
-			toast.success('Credential removed');
-			setTimeout(() => navigate('/'), 500);
-			return;
-		}
-
-		// otherwise remove the single stored credential
-		localStorage.removeItem('credentials');
-		if (setCredentialsList) setCredentialsList([]);
-		setSelectedCredentialIndex(0);
-		toast.success('Credential removed');
-		navigate('/config');
+		if (!credentials) return
+		if (!window.confirm(`Delete the saved credential for "${credentials.name}" from this browser? This cannot be undone.`)) return
+		const remaining = credentialsList.length - 1
+		removeCredential(selectedCredentialIndex)
+		toast.success('Credential removed')
+		navigate(remaining > 0 ? '/' : '/config')
 	}
+
+	if (!credentials) return null
 
 	return (
 		<div className="w-full min-h-dvh flex items-center justify-center bg-[#101010] text-gray-300">
-			<form onSubmit={handleSubmit} className="card p-8 shadow-lg w-full max-w-md flex flex-col gap-4">
+			<form onSubmit={handleSubmit} className="card p-8 shadow-lg w-full max-w-md flex flex-col gap-4" noValidate>
 				<h2 className="text-2xl font-bold mb-2 text-center">Edit Credentials</h2>
-				<input className="input" name="access_key" placeholder="Access Key" value={formData.access_key} onChange={handleChange} />
-				<input className="input" name="secret_key" placeholder="Secret Key" value={formData.secret_key} onChange={handleChange} type="password" />
-				<input className="input" name="region" placeholder="Region" value={formData.region} onChange={handleChange} />
-                <input className="input" name="name" placeholder="Bucket Name" value={formData.name} onChange={handleChange} />
-				<input className="input" name="endpoint" placeholder="Endpoint" value={formData.endpoint} onChange={handleChange} />
-				<input className="input" name="publicUrl" placeholder="Public Base URL (optional)" value={formData.publicUrl} onChange={handleChange} />
-				<button type="submit" className="btn btn-primary mt-2">Save</button>
-					<div className="flex items-center gap-2">
-						<button type="button" className="text-xs text-gray-400 hover:underline mt-2" onClick={() => navigate('/')}>Cancel</button>
-						<button type="button" onClick={handleDelete} className="ml-auto btn btn-danger mt-2">Delete</button>
+				{FIELDS.map(f => (
+					<div key={f.name} className="flex flex-col gap-1">
+						<input
+							className="input"
+							name={f.name}
+							type={f.type}
+							placeholder={f.placeholder}
+							aria-label={f.placeholder}
+							aria-invalid={Boolean(errors[f.name])}
+							autoComplete="off"
+							value={formData[f.name]}
+							onChange={handleChange}
+						/>
+						{errors[f.name] && <span role="alert" className="text-[11px] text-red-400">{f.placeholder}: {errors[f.name]}</span>}
 					</div>
+				))}
+				<button type="submit" className="btn btn-primary mt-2" disabled={saving}>{saving ? 'Checking…' : 'Save'}</button>
+				<div className="flex items-center gap-2">
+					<button type="button" className="text-xs text-gray-400 hover:underline mt-2" onClick={() => navigate('/')}>Cancel</button>
+					<button type="button" onClick={handleDelete} className="ml-auto btn btn-danger mt-2" disabled={saving}>Delete</button>
+				</div>
 			</form>
 		</div>
-	);
+	)
 }
