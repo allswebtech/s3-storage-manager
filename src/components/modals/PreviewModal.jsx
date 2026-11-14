@@ -172,7 +172,9 @@ function PreviewContent({ onClose, item, onSaved }) {
         <div className='flex-1 overflow-auto rounded border border-[#242424] bg-[#0e0e0e] p-3 flex flex-col'>
           {error && <div role='alert' className='text-red-400 text-xs mb-2'>{error}</div>}
           {mode === 'image' && openUrl && (
-            <img src={openUrl} alt={item.name} className='max-w-full max-h-full object-contain mx-auto' />
+            <div className='h-full flex items-center justify-center'>
+              <img src={openUrl} alt={item.name} className='max-w-full max-h-full object-contain' />
+            </div>
           )}
           {mode === 'video' && openUrl && (
             <video src={openUrl} controls className='w-full h-full max-h-[70vh]' />

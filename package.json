@@ -1,7 +1,7 @@
 {
   "name": "s3-storage-manager",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "description": "Browser-only file manager for AWS S3 and S3-compatible storage, built with React and Vite.",
   "author": "Kevin Pareek <git@kevinpareek.com>",
@@ -38,7 +38,8 @@
     "test:integration": "vitest run --project integration",
     "test:e2e": "playwright test",
     "s3:start": "bash scripts/s3-server.sh start",
-    "s3:stop": "bash scripts/s3-server.sh stop"
+    "s3:stop": "bash scripts/s3-server.sh stop",
+    "screenshots": "node scripts/screenshots.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1169.0",

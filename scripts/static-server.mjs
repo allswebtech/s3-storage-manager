@@ -46,8 +46,9 @@ createServer(async (req, res) => {
         } catch { /* fall through to 404.html */ }
         return await send(res, join(root, '404.html'), 404)
     } catch (err) {
+        console.error(err)
         res.writeHead(500)
-        res.end(String(err))
+        res.end('Internal server error')
     }
 }).listen(Number(portArg), '127.0.0.1', () => {
     console.log(`static server: http://localhost:${portArg}${base} -> ${root}`)

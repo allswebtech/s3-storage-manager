@@ -375,7 +375,7 @@ export default function FileDropper({ currentDirectory = '', uploading = false, 
                                     Upload Conflicts
                                 </h4>
                                 <p className='text-xs text-yellow-500/80 mt-0.5'>
-                                    {conflictCount} file(s) already exist in this folder
+                                    {conflictCount === 1 ? '1 file already exists in this folder' : `${conflictCount} files already exist in this folder`}
                                 </p>
                             </div>
                         </div>

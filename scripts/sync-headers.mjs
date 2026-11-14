@@ -27,7 +27,8 @@ export function renderVercelJson() {
     return `${JSON.stringify(config, null, 4)}\n`
 }
 
-const q = (v) => `"${v.replace(/"/g, '\\"')}"`
+// Apache config string: escape backslashes first, then double quotes.
+const q = (v) => `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
 
 export function renderHtaccess() {
     const headerLines = Object.entries(SECURITY_HEADERS)
