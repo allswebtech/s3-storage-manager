@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, useLocation, useSearchParams } from 'react-router-dom'
 import { toast } from 'react-toastify'
-import { House, LoaderCircle } from 'lucide-react'
+import { Database, House, LoaderCircle } from 'lucide-react'
 
 import FileDropper from './FileDropper'
 import Finder from './Finder'
@@ -208,7 +208,7 @@ export default function Container() {
         <div className='w-full px-2 sm:px-4 py-4 pb-24'>
             <div className='w-full max-w-6xl mx-auto card divide-y divide-[#252525]'>
                 <div className='w-full p-3 sm:p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2'>
-                    <h4 className='font-mono text-sm text-gray-300 select-none'>🗑️ {credentials?.name || 'No Credential'}</h4>
+                    <h4 className='font-mono text-sm text-gray-300 select-none flex items-center gap-2'><Database size={15} className='text-orange-300 shrink-0' aria-hidden='true' />{credentials?.name || 'No Credential'}</h4>
                     <div className='flex items-center gap-2 flex-wrap'>
                         <input
                             type='search'

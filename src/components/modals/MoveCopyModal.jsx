@@ -100,7 +100,7 @@ function MoveCopyForm({ onClose, items, mode = 'copy', onDone, currentDirectory 
 					<span className='text-[11px] text-gray-500'>Leave empty for the bucket root. End with “/” for a folder.</span>
 				</div>
 				<div>
-					<label htmlFor='move-copy-conflict' className='text-sm text-gray-400'>On conflict</label>
+					<label htmlFor='move-copy-conflict' className='block text-sm text-gray-400'>On conflict</label>
 					<select id='move-copy-conflict' className='input text-sm' value={action} onChange={e => setAction(e.target.value)}>
 						<option value='skip'>Skip</option>
 						<option value='replace'>Replace</option>

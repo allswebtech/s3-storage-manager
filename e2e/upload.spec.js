@@ -44,7 +44,7 @@ test('upload conflicts: replace, keep both, skip', async ({ page, s3, bucket, pr
     await putObject(s3, bucket, 's.txt', 'old s')
     await openWithCredential(page, bucket)
     await uploadFiles(page, ['r', 'k', 's'].map(n => ({ name: `${n}.txt`, mimeType: 'text/plain', buffer: Buffer.from(`new ${n}`) })))
-    await expect(page.getByText('3 file(s) already exist in this folder')).toBeVisible()
+    await expect(page.getByText('3 files already exist in this folder')).toBeVisible()
 
     await uploadItem(page, 'r.txt').getByRole('button', { name: 'Replace' }).click()
     await uploadItem(page, 'k.txt').getByRole('button', { name: 'Keep Both' }).click()

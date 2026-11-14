@@ -4,6 +4,21 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-11-14
+
+### Changed
+
+- The bucket name in the file list has a storage icon instead of a wastebasket emoji,
+  which looked like a delete button.
+- Image previews are centred in the preview window.
+- Button labels no longer break onto two lines.
+- The conflict notice uses correct singular and plural wording.
+- New README with new screenshots. `npm run screenshots` regenerates them.
+
+### Fixed
+
+- The "On conflict" label in the move/copy dialog overlapped its selector.
+
 ## [1.1.0] - 2026-11-14
 
 A stability and security release. Saved credentials from 1.0 keep working.
@@ -82,4 +97,5 @@ A stability and security release. Saved credentials from 1.0 keep working.
 First public version: browse, upload (multipart), rename, move, copy, delete, search,
 preview, ZIP download and several saved credentials.
 
+[1.1.1]: https://github.com/allswebtech/s3-storage-manager/releases/tag/v1.1.1
 [1.1.0]: https://github.com/allswebtech/s3-storage-manager/releases/tag/v1.1.0
