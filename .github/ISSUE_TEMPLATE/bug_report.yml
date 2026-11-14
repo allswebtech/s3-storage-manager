@@ -1,0 +1,42 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove access keys, secret keys and signed URLs from everything you paste.
+        Security problems: please use "Report a vulnerability" on the Security tab instead.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: The release you run, or the commit you built
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Storage provider
+      description: For example AWS S3, Cloudflare R2, MinIO, DigitalOcean Spaces, Wasabi
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you do, and what happened?
+      description: Steps to reproduce, what you expected and what you saw
+    validations:
+      required: true
+  - type: textarea
+    id: console
+    attributes:
+      label: Browser console and network errors
+      description: Open DevTools, repeat the action, and paste the error lines (no keys or signed URLs)
+      render: text
